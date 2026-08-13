@@ -13,7 +13,22 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
 ENV_PATH = os.path.join(PROJECT_DIR, ".env")
 
-load_dotenv(dotenv_path=ENV_PATH)
+
+def load_runtime_env():
+    env_path = ENV_PATH
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8-sig") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+    load_dotenv(dotenv_path=env_path, override=False)
+
+
+load_runtime_env()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY")
