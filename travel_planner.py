@@ -9,7 +9,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-load_dotenv()
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
+ENV_PATH = os.path.join(PROJECT_DIR, ".env")
+
+load_dotenv(dotenv_path=ENV_PATH)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY")
@@ -200,7 +204,7 @@ def main():
     date_str = parse_arguments()
     errors_list = []
 
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     print(f"[1/3] 1차 추천 생성 중(LLM)...")
     rec_data = get_llm_recommendation(date_str, errors_list)
@@ -221,8 +225,8 @@ def main():
         "errors": errors_list
     }
 
-    json_path = os.path.join("results", f"{date_str}_raw.json")
-    md_path = os.path.join("results", f"{date_str}_travel_plan.md")
+    json_path = os.path.join(RESULTS_DIR, f"{date_str}_raw.json")
+    md_path = os.path.join(RESULTS_DIR, f"{date_str}_travel_plan.md")
 
     with open(json_path, "w", encoding="utf-8") as file_obj:
         json.dump(raw_data, file_obj, ensure_ascii=False, indent=2)
