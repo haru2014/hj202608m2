@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+
+# Project output
+results/*.json
+results/*.md
+
+# Editors
+.vscode/
+.DS_Store
