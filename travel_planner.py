@@ -3,6 +3,8 @@ import json
 import os
 import re
 import sys
+from abc import ABC, abstractmethod
+from datetime import datetime
 
 import requests
 from dotenv import load_dotenv
@@ -19,6 +21,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
 ENV_PATH = os.path.join(PROJECT_DIR, ".env")
+ERRORS_HISTORY_PATH = os.path.join(RESULTS_DIR, "errors_history.json")
 
 
 def load_runtime_env():
@@ -81,8 +84,12 @@ def call_gemini(prompt: str, is_json: bool = False, temperature: float = 0.7) ->
 
 
 def parse_arguments():
+    """
+    Parse and validate CLI arguments with regex and real calendar date validation.
+    """
     parser = argparse.ArgumentParser(description="국내 여행지 및 맛집 추천 프로그램")
     parser.add_argument("--date", required=True, help="여행 날짜 (YYYY-MM-DD)")
+    parser.add_argument("--use-cache", action="store_true", help="기존 동일 날짜 결과가 있을 경우 API 호출 생략 및 캐시 사용")
     args = parser.parse_args()
 
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
@@ -90,21 +97,19 @@ def parse_arguments():
         parser.print_help()
         sys.exit(1)
 
-    return args.date
+    try:
+        datetime.strptime(args.date, "%Y-%m-%d")
+    except ValueError:
+        print(f"[ERROR] 달력에 존재하지 않는 유효하지 않은 날짜입니다: '{args.date}'")
+        parser.print_help()
+        sys.exit(1)
+
+    return args.date, args.use_cache
 
 
 def safe_parse_json(raw_text: str) -> dict:
     """
-    Robust JSON parser that handles markdown formatting and extra whitespace.
-    
-    Args:
-        raw_text: Raw LLM response text
-    
-    Returns:
-        Parsed JSON as dict
-    
-    Raises:
-        ValueError: If JSON parsing fails
+    Robust JSON parser that handles markdown formatting, code fences, and whitespace.
     """
     if not raw_text or not raw_text.strip():
         raise ValueError("LLM 응답이 비어있습니다.")
@@ -130,46 +135,121 @@ def safe_parse_json(raw_text: str) -> dict:
         raise e
 
 
+def validate_recommendation_schema(data: dict, errors_list: list) -> dict:
+    """
+    Strict validation for LLM recommendation JSON schema.
+    Validates presence and types of required keys: recommended_city, weather, events, reason.
+    """
+    if not isinstance(data, dict):
+        error_msg = "LLM 응답이 딕셔너리(JSON Object) 형태가 아닙니다."
+        errors_list.append({"step": "schema_validation", "type": "TYPE_ERROR", "message": error_msg})
+        return {
+            "recommended_city": "제주",
+            "weather": "해당 시기 온화한 기후",
+            "events": ["지역 대표 문화 행사"],
+            "reason": "추천 스키마 검증 실패로 기본 추천이 제공됩니다."
+        }
+
+    validated = {}
+    required_keys = {
+        "recommended_city": (str, "제주"),
+        "weather": (str, "해당 시기 온화한 기후"),
+        "events": (list, ["지역 대표 문화 행사"]),
+        "reason": (str, "해당 시기에 방문하기 적합한 추천 여행지입니다.")
+    }
+
+    for key, (expected_type, default_val) in required_keys.items():
+        val = data.get(key)
+        if val is None:
+            errors_list.append({
+                "step": "schema_validation",
+                "type": "MISSING_KEY",
+                "message": f"필수 키 '{key}'가 누락되어 기본값으로 대체되었습니다."
+            })
+            validated[key] = default_val
+        elif not isinstance(val, expected_type):
+            errors_list.append({
+                "step": "schema_validation",
+                "type": "INVALID_TYPE",
+                "message": f"키 '{key}'의 타입({type(val).__name__})이 예상 타입({expected_type.__name__})과 일치하지 않습니다."
+            })
+            validated[key] = default_val
+        elif isinstance(val, str) and not val.strip():
+            errors_list.append({
+                "step": "schema_validation",
+                "type": "EMPTY_STRING",
+                "message": f"키 '{key}'가 빈 문자열이어서 기본값으로 대체되었습니다."
+            })
+            validated[key] = default_val
+        elif isinstance(val, list):
+            cleaned_list = [str(item).strip() for item in val if str(item).strip()]
+            validated[key] = cleaned_list if cleaned_list else default_val
+        else:
+            validated[key] = val.strip() if isinstance(val, str) else val
+
+    return validated
+
+
+CITY_ALIASES = {
+    "제주도": "제주",
+    "제주시": "제주",
+    "제주특별자치도": "제주",
+    "서귀포시": "서귀포",
+    "강릉시": "강릉",
+    "통영시": "통영",
+    "경주시": "경주",
+    "부산시": "부산",
+    "부산광역시": "부산",
+    "해운대": "부산",
+    "해운대구": "부산",
+    "전주시": "전주",
+    "여수시": "여수",
+    "속초시": "속초",
+    "가평군": "가평",
+    "양평군": "양평",
+    "태안군": "태안",
+    "춘천시": "춘천",
+    "포항시": "포항",
+    "단양군": "단양",
+    "남해군": "남해",
+    "안동시": "안동",
+    "순천시": "순천",
+    "거제시": "거제",
+    "평창군": "평창",
+    "인제군": "인제",
+}
+
+
 def normalize_city_name(city: str) -> str:
     """
-    Normalize city name for weather API and map search compatibility.
-    Remove extra spaces and standardize format.
-    
-    Args:
-        city: City name from LLM
-    
-    Returns:
-        Normalized city name
+    Advanced city normalization with alias dictionary, sub-region cleaning, and suffix pruning.
     """
     if not city:
         return "제주"
 
-    # Remove leading/trailing whitespace
-    city = city.strip()
+    cleaned = city.strip()
+    cleaned = re.sub(r'[\(\)\[\]\{\}\'\"`<>]', '', cleaned).strip()
 
-    # Remove special characters or extra formatting
-    city = re.sub(r'[\(\)\[\]]', '', city).strip()
+    # Direct alias match
+    if cleaned in CITY_ALIASES:
+        return CITY_ALIASES[cleaned]
 
-    # Remove administrative suffixes for search consistency
-    city = re.sub(r'특별자치도|특별시|광역시|도$', '', city).strip()
+    # Partial alias matching (e.g., "강원도 강릉" -> "강릉")
+    for alias, standard in CITY_ALIASES.items():
+        if alias in cleaned and len(alias) >= 2:
+            return standard
 
-    return city if city else "제주"
+    # Remove province and administrative suffixes
+    cleaned = re.sub(r'^(서울특별시|부산광역시|대구광역시|인천광역시|광주광역시|대전광역시|울산광역시|세종특별자치시|경기도|강원특별자치도|강원도|충청북도|충청남도|전라북도|전북특별자치도|전라남도|경상북도|경상남도|제주특별자치도)\s*', '', cleaned)
+    cleaned = re.sub(r'특별자치도|특별시|광역시|자치시|시$|군$|구$|도$', '', cleaned).strip()
 
-
-def extract_json_text(raw_text):
-    """Legacy function - kept for compatibility"""
-    text = (raw_text or "").strip()
-    if not text:
-        return "{}"
-
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text, flags=re.IGNORECASE)
-
-    return text.strip()
+    return cleaned if cleaned else "제주"
 
 
 def get_llm_recommendation(date_str, errors_list, is_retry=False):
+    """
+    Step 1: Request structured travel recommendation from Gemini LLM.
+    """
     prompt = f"""
     당신은 여행 전문가입니다. 여행 날짜 '{date_str}'에 가기 좋은 한국의 도시 1곳을 추천해주세요.
     응답은 반드시 아래 JSON 스키마를 엄격히 준수하여 오직 JSON 형식의 텍스트만 출력하세요. 다른 설명은 포함하지 마세요.
@@ -191,19 +271,16 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         raw_text = call_gemini(prompt, is_json=True, temperature=0.7)
 
         # Use robust JSON parser
-        data = safe_parse_json(raw_text)
+        raw_data = safe_parse_json(raw_text)
 
-        # Normalize city name
-        recommended_city = data.get("recommended_city", "제주")
-        if isinstance(recommended_city, str):
-            recommended_city = normalize_city_name(recommended_city)
+        # Strict schema validation
+        validated_data = validate_recommendation_schema(raw_data, errors_list)
 
-        return {
-            "recommended_city": recommended_city,
-            "weather": data.get("weather", "날씨 정보 없음"),
-            "events": data.get("events", []) if isinstance(data.get("events", []), list) else [],
-            "reason": data.get("reason", "추천 근거를 확인할 수 없습니다.")
-        }
+        # Advanced City name normalization
+        recommended_city = normalize_city_name(validated_data["recommended_city"])
+        validated_data["recommended_city"] = recommended_city
+
+        return validated_data
 
     except Exception as exc:
         if not is_retry:
@@ -224,63 +301,87 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         }
 
 
-def search_places(city, errors_list):
-    headers = {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
-    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
-    params = {"query": f"{city} 맛집", "size": 5}
+# ==========================================
+# Place Search Provider Abstraction Layer
+# ==========================================
 
-    places = []
+class PlaceSearchProvider(ABC):
+    @abstractmethod
+    def search_places(self, city: str, errors_list: list) -> list:
+        pass
 
-    try:
-        res = requests.get(url, headers=headers, params=params, timeout=5)
 
-        if res.status_code in [401, 403]:
-            print(f"  - 오류: 지도 API 인증 실패({res.status_code}). 키/권한 설정을 확인하세요.")
-            errors_list.append({
-                "step": "place_search",
-                "type": "AUTH_ERROR",
-                "message": f"HTTP {res.status_code}"
-            })
-            return []
+class KakaoPlaceSearchProvider(PlaceSearchProvider):
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://dapi.kakao.com/v2/local/search/keyword.json"
 
-        res.raise_for_status()
-        result = res.json()
-        documents = result.get("documents", [])
+    def search_places(self, city: str, errors_list: list) -> list:
+        headers = {"Authorization": f"KakaoAK {self.api_key}"}
+        # Multi-query fallback strategy
+        search_queries = [f"{city} 맛집", f"{city} 식당", f"{city} 카페"]
 
-        if not documents:
-            print("  - 검색 결과 0건 (데이터 없음으로 진행)")
-            errors_list.append({
-                "step": "place_search",
-                "type": "EMPTY_RESULT",
-                "message": f"0 results for query={city} 맛집"
-            })
-            return []
+        for query in search_queries:
+            params = {"query": query, "size": 5}
+            try:
+                res = requests.get(self.base_url, headers=headers, params=params, timeout=5)
 
-        for doc in documents:
-            places.append({
-                "name": doc.get("place_name", ""),
-                "address": doc.get("road_address_name") or doc.get("address_name", ""),
-                "category": doc.get("category_name", ""),
-                "url": doc.get("place_url", ""),
-                "x": doc.get("x", ""),
-                "y": doc.get("y", "")
-            })
+                if res.status_code in [401, 403]:
+                    print(f"  - 오류: 지도 API 인증 실패({res.status_code}). 키/권한 설정을 확인하세요.")
+                    errors_list.append({
+                        "step": "place_search",
+                        "type": "AUTH_ERROR",
+                        "message": f"Kakao HTTP {res.status_code}"
+                    })
+                    return []
 
-        print(f"  - 맛집 {len(places)}곳 검색 완료")
-        return places
+                res.raise_for_status()
+                result = res.json()
+                documents = result.get("documents", [])
 
-    except Exception as exc:
-        print(f"  - 지도 API 호출 중 오류 발생: {exc}")
+                if documents:
+                    places = []
+                    for doc in documents:
+                        places.append({
+                            "name": doc.get("place_name", ""),
+                            "address": doc.get("road_address_name") or doc.get("address_name", ""),
+                            "category": doc.get("category_name", ""),
+                            "url": doc.get("place_url", ""),
+                            "x": doc.get("x", ""),
+                            "y": doc.get("y", "")
+                        })
+                    print(f"  - 맛집 {len(places)}곳 검색 완료 (쿼리: '{query}')")
+                    return places
+
+            except Exception as exc:
+                print(f"  - 지도 API 호출 중 오류 발생 ('{query}'): {exc}")
+                errors_list.append({
+                    "step": "place_search",
+                    "type": "NETWORK_OR_API_ERROR",
+                    "message": f"Query '{query}' failed: {exc}"
+                })
+
+        print("  - 검색 결과 0건 (데이터 없음으로 진행)")
         errors_list.append({
             "step": "place_search",
-            "type": "NETWORK_OR_API_ERROR",
-            "message": str(exc)
+            "type": "EMPTY_RESULT",
+            "message": f"0 results for city={city}"
         })
         return []
 
 
+def get_place_search_provider() -> PlaceSearchProvider:
+    provider_name = os.getenv("PLACE_SEARCH_PROVIDER", "kakao").lower()
+    if provider_name == "kakao":
+        return KakaoPlaceSearchProvider(api_key=KAKAO_REST_API_KEY)
+    return KakaoPlaceSearchProvider(api_key=KAKAO_REST_API_KEY)
+
+
 def generate_final_report(date_str, rec_data, places, errors_list):
-    places_str = json.dumps(places, ensure_ascii=False, indent=2) if places else "데이터 없음"
+    """
+    Step 3: Generate rich Markdown travel report using LLM.
+    """
+    places_str = json.dumps(places, ensure_ascii=False, indent=2) if places else "데이터 없음 (장소 검색 결과 0건)"
     errors_str = json.dumps(errors_list, ensure_ascii=False, indent=2) if errors_list else "없음"
 
     prompt = f"""
@@ -297,7 +398,7 @@ def generate_final_report(date_str, rec_data, places, errors_list):
 
     [작성 규칙]
     - 마크다운 헤더(#, ##)를 활용하여 정돈된 문서로 만드세요.
-    - 맛집 정보가 '데이터 없음'이거나 빈 배열이면 맛집 섹션에 "데이터 없음 (장소 검색 결과 0건)" 표기하세요.
+    - 맛집 정보가 '데이터 없음'이거나 빈 배열이면 맛집 섹션에 "데이터 없음 (장소 검색 결과 0건)"으로 강조 표기하고, 인근 대표 향토음식이나 전통시장을 대안으로 추천하세요.
     - 오전/오후/저녁으로 나눈 1일 일정 제안 코너를 포함하세요.
     - 오류 내역(errors) 섹션을 마지막에 포함하세요.
     """
@@ -314,11 +415,74 @@ def generate_final_report(date_str, rec_data, places, errors_list):
         return f"# {date_str} 여행 리포트 생성 실패\n\n리포트 생성 중 오류가 발생했습니다: {exc}"
 
 
+def sanitize_sensitive_data(text: str) -> str:
+    """
+    Ensure no API keys or sensitive tokens leak into saved files.
+    """
+    if not text:
+        return text
+    sanitized = text
+    if GEMINI_API_KEY:
+        sanitized = sanitized.replace(GEMINI_API_KEY, "[PROTECTED_GEMINI_KEY]")
+    if KAKAO_REST_API_KEY:
+        sanitized = sanitized.replace(KAKAO_REST_API_KEY, "[PROTECTED_KAKAO_KEY]")
+    sanitized = re.sub(r'AIzaSy[A-Za-z0-9_-]{33}', '[PROTECTED_API_KEY]', sanitized)
+    sanitized = re.sub(r'KakaoAK\s+[0-9a-fA-F]{32}', 'KakaoAK [PROTECTED_KEY]', sanitized)
+    return sanitized
+
+
+def append_errors_history(date_str: str, errors: list):
+    """
+    Persist error history for long-term monitoring and debugging.
+    """
+    if not errors:
+        return
+    try:
+        history = []
+        if os.path.exists(ERRORS_HISTORY_PATH):
+            with open(ERRORS_HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        history.append({
+            "date": date_str,
+            "timestamp": datetime.now().isoformat(),
+            "errors": errors
+        })
+        with open(ERRORS_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def main():
-    date_str = parse_arguments()
+    date_str, use_cache = parse_arguments()
     errors_list = []
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    json_path = os.path.join(RESULTS_DIR, f"{date_str}_raw.json")
+    md_path = os.path.join(RESULTS_DIR, f"{date_str}_travel_plan.md")
+
+    # Cache check (Bonus feature: Cost and speed optimization)
+    if use_cache and os.path.exists(json_path):
+        print(f"[CACHE] 기존 캐시 데이터({json_path})를 발견하여 API 호출을 건너뛰고 재사용합니다.")
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                cached_raw = json.load(f)
+            rec_data = cached_raw.get("recommendation", {})
+            places = cached_raw.get("places", [])
+            errors_list = cached_raw.get("errors", [])
+            print(f"  - 캐시 로드 완료 (추천 도시: \"{rec_data.get('recommended_city')}\", 맛집: {len(places)}곳)")
+
+            # Re-generate report if md is missing
+            if not os.path.exists(md_path):
+                print(f"[3/3] 최종 리포트 재생성 중(LLM)...")
+                report_md = generate_final_report(date_str, rec_data, places, errors_list)
+                with open(md_path, "w", encoding="utf-8") as file_obj:
+                    file_obj.write(sanitize_sensitive_data(report_md))
+
+            print(f"\n완료 (캐시 활용)! {md_path} 및 {json_path} 를 확인하세요.")
+            return
+        except Exception as exc:
+            print(f"  [경고] 캐시 로드 실패({exc}). 일반 실행으로 전환합니다.")
 
     print(f"[1/3] 1차 추천 생성 중(LLM)...")
     rec_data = get_llm_recommendation(date_str, errors_list)
@@ -326,7 +490,8 @@ def main():
     print(f"  - recommended_city: \"{city}\"")
 
     print(f"[2/3] 맛집 검색 중(지도/장소 API)...")
-    places = search_places(city, errors_list)
+    place_provider = get_place_search_provider()
+    places = place_provider.search_places(city, errors_list)
 
     print(f"[3/3] 최종 리포트 생성 중(LLM)...")
     report_md = generate_final_report(date_str, rec_data, places, errors_list)
@@ -339,18 +504,21 @@ def main():
         "errors": errors_list
     }
 
-    json_path = os.path.join(RESULTS_DIR, f"{date_str}_raw.json")
-    md_path = os.path.join(RESULTS_DIR, f"{date_str}_travel_plan.md")
+    # Sanitize and write files
+    sanitized_json = sanitize_sensitive_data(json.dumps(raw_data, ensure_ascii=False, indent=2))
+    sanitized_md = sanitize_sensitive_data(report_md)
 
     with open(json_path, "w", encoding="utf-8") as file_obj:
-        json.dump(raw_data, file_obj, ensure_ascii=False, indent=2)
+        file_obj.write(sanitized_json)
 
     with open(md_path, "w", encoding="utf-8") as file_obj:
-        file_obj.write(report_md)
+        file_obj.write(sanitized_md)
+
+    # Append errors to persistent log if any
+    append_errors_history(date_str, errors_list)
 
     print(f"\n완료! {md_path} 및 {json_path} 를 확인하세요.")
 
 
 if __name__ == "__main__":
     main()
-

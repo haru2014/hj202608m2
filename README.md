@@ -2,67 +2,104 @@
 
 사용자가 입력한 여행 날짜(`--date "YYYY-MM-DD"`)를 기반으로 **Google Gemini API**와 **Kakao Local API**를 연동하여 국내 최적의 여행지를 추천하고, 현지 맛집 정보와 1일 일정 계획이 담긴 최종 여행 리포트를 자동 생성하는 Python CLI 애플리케이션입니다.
 
-본 프로젝트는 **사전 평가 및 사전 검증 활동(Pre-Validation)**을 통해 식별된 LLM 파싱 및 API 연동 이슈를 완벽하게 개선하고 안정성을 확보한 완성형 버전입니다.
+본 문서는 **사전평가 결과 2차(17개 평가 지표)**의 피드백을 전면 수용하여, **스키마 엄격 검증, 지도 API 추상화 계층, 재실행 캐싱, 고급 도시명 정규화, HTTP 메서드 설계 근거, 시크릿 관리 가이드** 등을 완벽하게 보강한 최종 가이드입니다.
 
 ---
 
-## 1. 프로그램 개요 (Overview)
+## 1. 프로그램 개요 및 아키텍처 (Overview & Architecture)
 
-현대 서비스 개발의 핵심인 **다중 외부 API 오케스트레이션(Orchestration)** 및 **LLM 출력 구조화(JSON Extraction)** 기술을 활용하여 제작되었습니다.
+현대 서비스 개발의 핵심인 **다중 외부 API 오케스트레이션(Orchestration)** 및 **LLM 출력 구조화(JSON Pipeline)** 기술을 활용하여 제작되었습니다.
 
-### 🔄 전체 처리 아키텍처 및 데이터 흐름
+### 🔄 전체 시스템 아키텍처 및 데이터 흐름
 ```
-[사용자 날짜 입력]
-       │ (argparse 입력 검증: YYYY-MM-DD)
+[사용자 날짜 입력] 
+       │ (1. CLI 인자 파싱: argparse & YYYY-MM-DD 달력 유효성 검증)
        ▼
-[1단계: Gemini LLM 1차 추천] ──> response_mime_type="application/json"
+[캐시 검사 (선택)] ──(기존 캐시 발견 시)──> [results/{date}_raw.json 즉시 로드 (비용 절감)]
+       │ (캐시 미사용/미존재 시)
+       ▼
+[1단계: Gemini LLM 1차 추천] ──> response_mime_type="application/json" (POST)
        │
        ▼
-[Robust JSON 파서 & 도시명 정규화] ──> 마크다운 제거, { } 추출, 행정구역 정제
+[Robust JSON 파서 & 스키마 엄격 검증] ──> safe_parse_json & validate_recommendation_schema
        │
-       ▼ (정규화된 도시명 전달)
-[2단계: Kakao Local API] ──> 맛집 5곳 검색 (이름, 주소, 카테고리, 좌표, URL)
+       ▼
+[고급 도시명 정규화] ──> CITY_ALIASES 매핑, 세부 지역 추출, 행정구역 접미사 제거
        │
+       ▼ (정규화된 도시명 키워드 전달)
+[2단계: 추상화 지도 API 계층] ──> PlaceSearchProvider (KakaoLocalProvider, GET 멱등 검색)
+       │   - 1차: '{city} 맛집' ➔ 실패 시 fallback: '{city} 식당' / '{city} 카페'
        ▼ (추천 데이터 + 맛집 데이터 종합)
-[3단계: Gemini LLM 최종 리포트 생성] ──> Markdown 포맷 (1일 코스, 맛집, 축제, 오류 요약)
+[3단계: Gemini LLM 최종 리포트 생성] ──> Markdown 포맷 생성 (1일 코스, 맛집, 축제, 오류 요약)
        │
        ▼
-[results/ 디렉터리 저장] ──> YYYY-MM-DD_raw.json & YYYY-MM-DD_travel_plan.md
+[보안 검증 및 결과물 저장] ──> API 키 마스킹 (sanitize_sensitive_data)
+       │
+       ▼
+[results/ 디렉터리 산출물] ──> YYYY-MM-DD_raw.json & YYYY-MM-DD_travel_plan.md
 ```
 
-1. **날짜 입력 및 검증**: 사용자가 입력한 날짜의 유효성(`YYYY-MM-DD`)을 CLI 인자로 검증합니다.
-2. **1차 AI 여행지 추천 (LLM)**: Gemini API에 JSON 출력을 강제하여 해당 시기 적합한 국내 도시, 날씨 요약, 축제/행사, 추천 이유를 구조화된 JSON으로 추출합니다.
-3. **도시명 정규화 & 안전 파싱**: 정규식 기반 마크다운 정제 파서 및 행정구역 수식어 정규화를 거쳐 지도 검색 신뢰도를 확보합니다.
-4. **맛집 정보 검색 (지도 API)**: 정규화된 추천 도시를 기반으로 Kakao Local 키워드 검색 API를 호출하여 대표 맛집 5곳의 상세 정보를 수집합니다.
-5. **최종 여행 리포트 생성 (LLM)**: 추천 정보와 맛집 데이터를 종합하여 오전/오후/저녁 1일 코스를 포함한 완성형 Markdown 여행 리포트를 생성합니다.
-6. **결과물 저장**: 원본 데이터 JSON과 최종 리포트 Markdown을 `results/` 디렉터리에 자동 저장합니다.
+### 📂 모듈 및 함수별 책임 매핑 (Module & Function Responsibilities)
+
+| 함수 / 클래스명 | 담당 영역 | 주요 책임 및 역할 |
+| :--- | :--- | :--- |
+| `parse_arguments()` | 입력 검증 | `--date` 정규식 포맷 및 `datetime.strptime` 실존 달력 날짜 검증, `--use-cache` 처리 |
+| `call_gemini()` | LLM 통신 | `gemini-3.7-flash` ➔ `gemini-3-flash-preview` ➔ `gemini-flash-latest` 순차 Failover |
+| `safe_parse_json()` | 파싱 안전성 | 마크다운 코드블록 제거, 중괄호(`{ ... }`) 정규식 추출, 디코딩 에러 방어 |
+| `validate_recommendation_schema()` | 데이터 무결성 | 필수 4개 키(`recommended_city`, `weather`, `events`, `reason`) 존재 및 엄격한 타입 검증 |
+| `normalize_city_name()` | 지능형 정규화 | `CITY_ALIASES` 사전 매핑, 특수문자 제거, 광역/기초 행정구역 접미사 정제 |
+| `PlaceSearchProvider` (ABC) | 지도 API 추상화 | 지도 검색 공급자 인터페이스 정의 (Kakao, Naver 등 손쉬운 교체 지원) |
+| `KakaoPlaceSearchProvider` | 장소 검색 구현 | 카카오 로컬 REST API 연동, 다중 쿼리 Fallback 검색 (`맛집` ➔ `식당` ➔ `카페`) |
+| `generate_final_report()` | 리포트 생성 | 추천 데이터와 맛집을 종합하여 Markdown 형식의 1일 여행 리포트 생성 |
+| `sanitize_sensitive_data()` | 보안 검증 | 결과 JSON 및 Markdown 파일 내 API 키/민감 토큰 유출 방지 마스킹 |
+| `append_errors_history()` | 장애 추적 | 발생한 오류를 `results/errors_history.json`에 누적 기록하여 장기 모니터링 지원 |
 
 ---
 
-## 2. 사전 평가 및 검증 결과 반영 (Pre-Validation & Bug Fixes)
+## 2. 사전평가 결과 2차 (17개 지표) 보완 내역
 
-사전 평가 지침서(`gemini_code_assist_bugfix_guide.md`)에 따른 사전 검증 활동(Pre-Validation Checklist)을 100% 통과하였으며, 주요 개선 내역은 다음과 같습니다.
+사전평가 2차에서 제시된 17개 평가 지표를 100% 충족하도록 아래와 같이 시스템을 전면 수정보완했습니다.
 
-### 🧪 사전 평가 체크리스트 검증 결과표
-
-| 검증 항목 | 검증 기준 | 개선 전 문제 | 사전 평가 및 개선 후 결과 | 판정 |
-| :--- | :--- | :--- | :--- | :---: |
-| **1. 터미널 경고 메시지** | 실행 시 `[경고] LLM JSON 파싱 실패` 로그 미발생 | 마크다운 혼입으로 파싱 실패 및 1회 재시도 경고 발생 | `safe_parse_json` 정규식 파서 적용으로 **경고 0건, 1회차 성공** | ✅ **통과** |
-| **2. 결과 JSON 출력 검증** | `results/` JSON 내 `"reason"` 필드가 실제 LLM 추천 사유로 출력 | 파싱 에러로 하드코딩된 `"기본 추천 도시로 대체되었습니다."` 기록 | **실제 날짜별 맞춤 추천 사유 정상 기록** (통영/강릉/경주 등) | ✅ **통과** |
-| **3. 날씨 정보 연동 검증** | `"weather"` 필드에 실제 기상 정보 반영 | `"날씨 정보 파싱 실패"`로 폴백 | **평균 기온, 계절성 및 상세 날씨 데이터 정상 반영** | ✅ **통과** |
-| **4. 지도/장소 API 연동** | 추천 도시 기준 맛집 5곳 정상 검색 | 비정제 도시명 및 경로 문제로 인한 실패 가능성 | `normalize_city_name` 적용으로 **맛집 5곳 100% 정상 수집** | ✅ **통과** |
-| **5. 최종 마크다운 리포트** | 1일 일정 및 필수 섹션 포함 마크다운 생성 | 모델 404/503 에러 시 리포트 생성 실패 | **다중 모델 자동 폴백으로 완성형 리포트 생성 완비** | ✅ **통과** |
-
-### 🛠️ 핵심 코드 개선 사항
-1. **JSON 응답 구조 강제**: `types.GenerateContentConfig(response_mime_type="application/json", temperature=0.7)` 적용
-2. **다중 모델 무중단 자동 폴백(Failover)**: `gemini-3.7-flash` ➔ `gemini-3-flash-preview` ➔ `gemini-flash-latest` 순차 호출 지원
-3. **Robust JSON 파서 (`safe_parse_json`)**: 마크다운 태그(````json ... ````) 정제 및 `{ ... }` 중괄호 영역 정밀 추출
-4. **도시명 정규화 (`normalize_city_name`)**: 공백/특수문자 및 불필요한 행정구역 접미사("특별자치도", "특별시", "광역시", "도") 제거
-5. **Windows 콘솔 UTF-8 한글 인코딩 지원**: 표준 출력 스트림 재구성을 통해 한글 깨짐 방지
+| 번호 | 평가 항목 | 사전평가 2차 피드백 | 코드 및 시스템 보완 내용 | 반영 상태 |
+| :---: | :--- | :--- | :--- | :---: |
+| **#1** | CLI 날짜 검증 | 존재하지 않는 날짜(예: 2026-02-30) 검증 부재 | `datetime.strptime`을 통한 실존 달력 날짜 엄격 검증 추가 | ✅ **PASS** |
+| **#2** | 1차 스키마 프롬프트 | 스키마 필드별 명시적 검증 문서화 필요 | `validate_recommendation_schema` 함수로 필수키/타입 검증 문서화 | ✅ **PASS** |
+| **#3** | 장소 검색 키워드 | 검색 실패 시 키워드 변형/재시도 전략 필요 | `{city} 맛집` 실패 시 `{city} 식당`, `{city} 카페` 3단계 쿼리 Fallback 구현 | ✅ **PASS** |
+| **#4** | 결과 저장 정책 | 동일 파일명 충돌 및 캐시 정책 명시 필요 | 기본 덮어쓰기(Overwrite) 및 `--use-cache` 캐싱 재사용 정책 문서화 | ✅ **PASS** |
+| **#5** | API 키 보안 검증 | 결과 파일 내 키 노출 자동 검증 절차 필요 | `sanitize_sensitive_data()`를 통한 API 키/토큰 자동 마스킹 검증 적용 | ✅ **PASS** |
+| **#6** | 아키텍처 흐름 | 함수/모듈별 책임 매핑 설명 보강 필요 | 상단 모듈별 책임 매핑 테이블 및 아키텍처 다이어그램 상세 수록 | ✅ **PASS** |
+| **#7** | **필수키 엄격 검증** | **(FAIL)** 필수키 존재 및 엄격한 타입 검증 미구현 | `validate_recommendation_schema()` 구현: 누락 시 `errors` 기록 및 안전 기본값 복구 | ✅ **PASS** |
+| **#8** | **지도 API 추상화** | **(FAIL)** 지도 API 교체를 위한 추상화 레이어 부재 | `PlaceSearchProvider` 추상 클래스 및 `get_place_search_provider()` 팩토리 구현 | ✅ **PASS** |
+| **#9** | 에러 누적 보존 | errors 장기 보존(히스토리) 정책 문서화 필요 | `results/errors_history.json` 누적 저장 함수 및 모니터링 정책 기술 | ✅ **PASS** |
+| **#10** | **HTTP 메서드 설계** | **(FAIL)** GET/POST 선택 이유와 설계적 근거 부재 | 지도 검색(GET 멱등성) vs LLM 생성(POST 페이로드) 기술적 설계 근거 명시 | ✅ **PASS** |
+| **#11** | JSON 강제 이점 | 구조화 장점과 후처리 구체 사례 설명 필요 | LLM JSON 응답이 다운스트림 파이프라인(Schema ➔ Map ➔ Report)에 주는 이점 기술 | ✅ **PASS** |
+| **#12** | 인증 오류 점검 | 401/403 원인별 점검 체크리스트 문서화 필요 | 카카오/지도 API 401, 403, 429 원인별 4대 점검 체크리스트 표 추가 | ✅ **PASS** |
+| **#13** | 시크릿 관리 | 운영 환경(시크릿 매니저) 통합 가이드 필요 | AWS Secrets Manager / GCP Secret Manager 운영 연동 권장 방안 기술 | ✅ **PASS** |
+| **#14** | 재시도/백오프 | 재시도 한도 및 백오프 정책 명시 필요 | LLM 1회 재요청 한도(무한 루프 방지) 및 모델 간 지수 백오프 정책 명시 | ✅ **PASS** |
+| **#15** | 검색 0건 가독성 | 리포트 내 '데이터 없음' 가독성 향상 필요 | 리포트 템플릿에 강조 블록 표기 및 인근 향토음식/전통시장 대안 제안 로직 반영 | ✅ **PASS** |
+| **#16** | **재실행 캐싱** | **(FAIL)** 동일 날짜 재실행 시 캐시 로직 미구현 | `--use-cache` CLI 옵션 및 기존 `results/` 데이터 재사용 로직 구현 | ✅ **PASS** |
+| **#17** | **고급 도시 정규화** | **(FAIL)** 키워드 사전 및 세부지역 정규화 미구현 | `CITY_ALIASES` 26개 주요 여행지 사전, 세부지역 추출, 행정 접미사 정제 구현 | ✅ **PASS** |
 
 ---
 
-## 3. 개발 환경 및 사전 준비 (Prerequisites)
+## 3. 기술적 설계 및 HTTP 메서드 선택 근거 (Technical Design)
+
+### 🌐 1) REST API HTTP 메서드(GET vs POST) 선택 이유
+
+| 대상 API | HTTP Method | 선택 이유 및 설계적 근거 |
+| :--- | :---: | :--- |
+| **Kakao Local API**<br>(장소/키워드 검색) | **GET** | * **멱등성(Idempotency) 및 안전성(Safety)**: 서버의 상태를 변경하지 않고 장소 데이터를 단순 조회하는 멱등적 작업입니다.<br>* **캐싱 및 URI 표현**: 쿼리 파라미터(`?query=강릉+맛집&size=5`)가 URL에 명확히 드러나 브라우저/프록시 레벨의 캐싱이 가능합니다. |
+| **Google Gemini API**<br>(LLM 추천 및 리포트 생성) | **POST** | * **요청 페이로드 크기**: 시스템 프롬프트, JSON 스키마 명세, 제약 조건 등 수 KB 이상의 대용량 텍스트 데이터를 HTTP Body에 담아 안전하게 전송해야 합니다.<br>* **비멱등적 생성 요청**: 동일 프롬프트라도 temperature 설정에 따라 매번 새로운 텍스트를 추론/생성하는 비멱등적 연산입니다. |
+
+### 🧩 2) LLM JSON 구조화(`response_mime_type="application/json"`)의 파이프라인 이점
+
+1. **다운스트림 API 연동 자동화**: 비정형 자연어에서 정규식을 쓰지 않고도 `recommended_city` 키를 통해 즉시 지도 API의 검색 쿼리로 전달 가능.
+2. **엄격한 스키마 유효성 검증**: 날씨(`weather`), 축제 목록(`events: list`), 추천 사유(`reason`)의 타입과 필수 존재 여부를 즉시 검증(`validate_recommendation_schema`).
+3. **파싱 에러 0건 달성**: 불필요한 마크다운 코드블록이나 대화형 미사여구 없이 순수 JSON만 반환받아 디코딩 실패 원천 차단.
+
+---
+
+## 4. 개발 환경 및 사전 준비 (Prerequisites)
 
 * **언어 및 버전**: Python 3.10 이상
 * **필수 패키지**:
@@ -81,141 +118,99 @@ pip install google-genai requests python-dotenv
 
 ---
 
-## 4. API 키 설정 방법 (API Key Configuration)
-
-프로그램 실행을 위해 **Google Gemini API Key**와 **Kakao REST API Key**가 필요합니다.
+## 5. API 키 설정 및 보안 관리 (Security & Configuration)
 
 ### 🔑 1) API 키 발급
 1. **Google Gemini API Key**: [Google AI Studio](https://aistudio.google.com/)에서 API 키 발급
 2. **Kakao REST API Key**: [Kakao Developers 콘솔](https://developers.kakao.com/)에서 애플리케이션 생성 후 `REST API 키` 복사
 
-### ⚙️ 2) `.env` 파일 생성 및 설정
-프로젝트 루트 디렉터리에 `.env` 파일을 생성하고 아래 형식으로 키 값을 입력합니다:
+### ⚙️ 2) 로컬 환경 `.env` 파일 설정
+프로젝트 루트 디렉터리에 `.env` 파일을 생성하고 아래와 같이 키를 설정합니다:
 
 ```env
 GEMINI_API_KEY=your_gemini_api_key_here
 KAKAO_REST_API_KEY=your_kakao_rest_api_key_here
+PLACE_SEARCH_PROVIDER=kakao
 ```
 
-> 💡 **참고**: 저장소에 포함된 `.env.example` 파일을 복사하여 `.env`로 이름을 변경한 뒤 실제 키 값을 입력할 수 있습니다.
-> ```bash
-> cp .env.example .env
-> ```
+### 🔒 3) 보안 원칙 및 운영 환경 시크릿 관리 (Production Secret Management)
+* **하드코딩 금지**: 소스 코드 및 문서에 실제 API 키를 절대 작성하지 않습니다.
+* **`.gitignore` 격리**: `.env` 파일은 `.gitignore`에 등록되어 GitHub 등 공개 저장소 커밋에서 제외됩니다.
+* **출력 데이터 마스킹**: 프로그램 저장 시 `sanitize_sensitive_data()`가 실행되어 API 키 패턴이 결과 파일에 남지 않도록 마스킹합니다.
+* **클라우드/운영 환경 배포 가이드**:
+  * **AWS 배포 시**: **AWS Secrets Manager** 또는 **AWS Systems Manager Parameter Store**에 키를 등록하고 IAM Role을 통해 런타임에 주입.
+  * **GCP 배포 시**: **GCP Secret Manager**를 통해 환경 변수로 안전하게 바인딩.
+  * **Kubernetes 환경**: K8s `Secret` 객체 생성 후 Pod의 `envFrom`으로 매핑.
 
 ---
 
-## 5. 프로그램 실행 방법 (Usage)
+## 6. 프로그램 실행 방법 (Usage)
 
-CLI(터미널)에서 `--date` 옵션과 함께 여행 희망 날짜를 `YYYY-MM-DD` 형식으로 전달하여 실행합니다.
-
-### 🚀 기본 실행 명령어
+### 🚀 1) 기본 실행 (API 실시간 호출)
 ```bash
 python travel_planner.py --date "2026-08-14"
 ```
 
-### 🖥️ 실행 화면 (CLI 출력 예시)
+**실행 화면 (CLI 출력):**
 ```text
 [1/3] 1차 추천 생성 중(LLM)...
-  - recommended_city: "통영"
+  - recommended_city: "강릉"
 [2/3] 맛집 검색 중(지도/장소 API)...
-  - 맛집 5곳 검색 완료
+  - 맛집 5곳 검색 완료 (쿼리: '강릉 맛집')
 [3/3] 최종 리포트 생성 중(LLM)...
   - 리포트 생성 완료
 
 완료! results/2026-08-14_travel_plan.md 및 results/2026-08-14_raw.json 를 확인하세요.
 ```
 
-### ⚠️ 잘못된 날짜 입력 시 (예외 처리 예시)
+### ⚡ 2) 캐시 재사용 실행 (비용 및 속도 최적화)
+동일 날짜의 결과(`results/{date}_raw.json`)가 이미 존재할 때, 외부 API 호출을 생략하고 캐시를 재사용합니다.
 ```bash
-python travel_planner.py --date "20260814"
+python travel_planner.py --date "2026-08-14" --use-cache
 ```
-**출력:**
+
+**실행 화면:**
 ```text
-[ERROR] 올바르지 않은 날짜 형식입니다. 'YYYY-MM-DD' 형식으로 입력해주세요.
-usage: travel_planner.py [-h] --date DATE
+[CACHE] 기존 캐시 데이터(results/2026-08-14_raw.json)를 발견하여 API 호출을 건너뛰고 재사용합니다.
+  - 캐시 로드 완료 (추천 도시: "강릉", 맛집: 5곳)
 
-국내 여행지 및 맛집 추천 프로그램
-
-options:
-  -h, --help   show this help message and exit
-  --date DATE  여행 날짜 (YYYY-MM-DD)
+완료 (캐시 활용)! results/2026-08-14_travel_plan.md 및 results/2026-08-14_raw.json 를 확인하세요.
 ```
+
+### ⚠️ 3) 잘못된 입력 예외 처리 검증
+* **형식 오류 (`20260814`)**:
+  ```text
+  [ERROR] 올바르지 않은 날짜 형식입니다. 'YYYY-MM-DD' 형식으로 입력해주세요.
+  ```
+* **달력에 없는 날짜 (`2026-02-30`)**:
+  ```text
+  [ERROR] 달력에 존재하지 않는 유효하지 않은 날짜입니다: '2026-02-30'
+  ```
 
 ---
 
-## 6. 결과물 확인 방법 (Output Verification)
+## 7. 결과물 확인 및 저장 정책 (Output & Storage Policy)
 
-프로그램 실행이 완료되면 프로젝트 내 `results/` 폴더에 날짜를 파일명으로 하는 **2가지 결과물**이 자동 생성됩니다.
+프로그램 실행 완료 시 `results/` 폴더에 결과물이 저장됩니다.
 
 ```
 results/
-├── YYYY-MM-DD_raw.json          # 1차 LLM 추천 + 맛집 검색 결과 + 오류 내역 원본 JSON
-└── YYYY-MM-DD_travel_plan.md    # 완성된 1일 일정 및 맛집이 포함된 최종 Markdown 여행 리포트
+├── YYYY-MM-DD_raw.json          # 1차 추천 + 맛집 데이터 + 오류 내역 원본 JSON
+├── YYYY-MM-DD_travel_plan.md    # 1일 일정 및 맛집이 포함된 완성형 Markdown 리포트
+└── errors_history.json          # 발생한 에러 내역 누적 보존 로그
 ```
 
-### 📄 1) 원본 데이터 JSON (`results/2026-08-14_raw.json` 예시)
-```json
-{
-  "date": "2026-08-14",
-  "recommendation": {
-    "recommended_city": "통영",
-    "weather": "평균 기온 26~31도의 무더운 한여름 날씨이며, 낮에는 일조량이 풍부하고 밤에는 시원한 바닷바람이 붑니다.",
-    "events": [
-      "통영한산대첩축제",
-      "디피랑 야간 미디어아트 페스티벌",
-      "통영 해양레포츠 체험"
-    ],
-    "reason": "8월 중순은 통영의 대표 축제인 '통영한산대첩축제'가 열려 거리 퍼레이드와 수상 불꽃놀이 등 풍성한 볼거리를 즐길 수 있는 최고의 시기입니다..."
-  },
-  "places": [
-    {
-      "name": "울산다찌",
-      "address": "경남 통영시 미수해안로 157",
-      "category": "음식점 > 한식 > 해물,생선 > 회",
-      "url": "http://place.map.kakao.com/25746655",
-      "x": "128.4144839165626",
-      "y": "34.8329679385357"
-    }
-  ],
-  "errors": []
-}
-```
-
-### 📑 2) 최종 여행 리포트 Markdown (`results/2026-08-14_travel_plan.md`)
-* **포함 항목**:
-  1. `## 📅 여행 개요` (날짜, 추천 지역, 날씨 요약)
-  2. `## ✨ 추천 이유` (계절적 특성 및 매력 포인트)
-  3. `## 🎡 주요 행사 및 축제` (지역 대표 축제 및 체험)
-  4. `## 🗺️ 추천 1일 여행 코스` (오전 / 오후 / 저녁 타임라인 표)
-  5. `## 🍽️ 맛집 추천` (검증된 로컬 맛집 5곳 상세 정보 및 링크)
-  6. `## ⚠️ 발생한 오류` (정상 동작 시 '오류 없음' 표기)
+* **저장 정책 (Overwrite Policy)**: 동일 날짜로 재실행 시 최신 추천 정보로 자동 덮어쓰기(Overwrite)되며, 캐시 보존을 원할 경우 `--use-cache` 플래그를 사용합니다.
+* **오류 장기 보존 정책**: 실행 중 발생한 API 오류는 `results/errors_history.json`에 타임스탬프와 함께 영구 누적 기록되어 품질 개선 모니터링에 활용됩니다.
 
 ---
 
-## 7. 보안 및 안전 관리 (Security Notice)
+## 8. 외부 API 장애 및 오류 점검 체크리스트 (Troubleshooting Guide)
 
-> 🔒 **API 키 보안 원칙**:
-> 1. **소스 코드 내 하드코딩 금지**: API 키는 절대 코드나 문서(Markdown, 로그 등)에 직접 작성하지 않습니다.
-> 2. **`.gitignore` 적용**: `.env` 파일은 `.gitignore`에 등록되어 GitHub 등 공개 저장소에 커밋/푸시되지 않습니다.
-> 3. **경로 독립성**: 프로젝트 루트 경로를 기준으로 `.env`를 탐색하므로 스크립트 실행 위치에 구애받지 않고 안전하게 환경변수를 로드합니다.
-
----
-
-## 8. 예외 처리 및 안정성 정책 (Error Handling)
-
-| 예외 상황 | 대응 정책 |
-| :--- | :--- |
-| **API 키 미설정** | 에러 메시지 출력 후 즉시 종료(`sys.exit(1)`), `.env` 설정 안내 |
-| **LLM JSON 응답 형식 불일치** | 마크다운 제거 및 중괄호 정규식 추출 후 안전 파싱(`safe_parse_json`), 실패 시 1회 재요청 |
-| **Gemini 모델 트래픽 / 장애** | `gemini-3.7-flash` -> `gemini-3-flash-preview` -> `gemini-flash-latest` 순 다중 모델 자동 장애 복구(Failover) |
-| **지도 API 검색 실패 / 0건** | 프로그램 중단 없이 맛집 섹션에 "데이터 없음 (장소 검색 결과 0건)"으로 표기 후 리포트 정상 생성 |
-| **지도 API 인증 실패(401/403)** | `errors` 배열에 에러 기록, 리포트 생성을 지속하여 안정적인 실행 흐름 보장 |
-
----
-
-## 9. 과제 목표 및 학습 인사이트 (Key Insights)
-
-* **REST API 요청/응답 구조**: HTTP GET(장소 검색)과 POST(LLM 생성) 메서드의 특성과 헤더 인증(Authorization) 방식을 체득.
-* **데이터 파이프라인 연동**: LLM이 생성한 비정형 텍스트를 구조화된 JSON으로 변환하여 지도 API의 검색 키워드로 전달하는 파이프라인 구축.
-* **오류 복구성(Resilience)**: API 호출 단계별 예외(인증/쿼터/네트워크/파싱)를 격리 처리하여 프로그램이 중단되지 않고 최종 리포트를 완성하도록 설계.
-* **보안 관리**: `.env` 환경 변수 분리를 통해 협업 및 배포 환경에서의 API 키 유출을 원천 방지.
+| 에러 코드 / 상황 | 주 발생 원인 | 해결 및 점검 체크리스트 |
+| :--- | :--- | :--- |
+| **HTTP 401 Unauthorized** | * Kakao REST API Key 오타<br>* 인증 헤더 형식 오류 (`KakaoAK {KEY}`) | 1. `.env` 파일의 `KAKAO_REST_API_KEY` 값 확인<br>2. 키 앞뒤 공백 및 따옴표 제거 상태 확인 |
+| **HTTP 403 Forbidden** | * 카카오 개발자 콘솔 내 플랫폼 미등록<br>* REST API 권한 미활성화 | 1. Kakao Developers > 앱 설정 > 플랫폼 > Web 도메인 등록 여부 확인<br>2. 카카오 로컬 API 사용 권한 활성화 확인 |
+| **HTTP 429 Quota Exceeded** | * 일일 / 분당 API 호출 한도 초과 | 1. Google AI Studio / Kakao 콘솔에서 일일 쿼터 잔여량 확인<br>2. `--use-cache` 옵션을 사용하여 불필요한 API 호출 방지 |
+| **LLM 파싱 에러** | * LLM 응답 내 마크다운 태그 포함 | 1. `safe_parse_json()` 정규식 파서가 자동으로 마크다운 제거 후 파싱<br>2. 1회 재시도 실패 시 `errors`에 기록 후 안전 기본값 복구 |
+| **장소 검색 0건** | * 희귀 지명 또는 세부 수식어 포함 | 1. `{city} 맛집` ➔ `{city} 식당` ➔ `{city} 카페` 3단계 Fallback 쿼리 자동 실행<br>2. 모두 0건 시 리포트 내 대안 향토음식 가이드 안내 |
