@@ -54,7 +54,72 @@ def parse_arguments():
     return args.date
 
 
+def safe_parse_json(raw_text: str) -> dict:
+    """
+    Robust JSON parser that handles markdown formatting and extra whitespace.
+    
+    Args:
+        raw_text: Raw LLM response text
+    
+    Returns:
+        Parsed JSON as dict
+    
+    Raises:
+        ValueError: If JSON parsing fails
+    """
+    if not raw_text:
+        raise ValueError("LLM 응답이 비어있습니다.")
+
+    # Remove markdown code fences
+    cleaned = re.sub(r'```(?:json)?\s*([\s\S]*?)\s*```', r'\1', raw_text).strip()
+    
+    # If no markdown was found, try basic extraction
+    if not cleaned or cleaned == raw_text.strip():
+        # Try to find JSON object pattern
+        json_match = re.search(r'\{[\s\S]*\}', cleaned or raw_text)
+        if json_match:
+            cleaned = json_match.group(0)
+    
+    try:
+        result = json.loads(cleaned)
+        if not isinstance(result, dict):
+            raise ValueError("LLM 응답이 JSON 객체가 아닙니다.")
+        return result
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON 파싱 에러 발생: {e}")
+        print(f"[DEBUG] Raw LLM Output:\n{raw_text}")
+        print(f"[DEBUG] Cleaned Text:\n{cleaned}")
+        raise e
+
+
+def normalize_city_name(city: str) -> str:
+    """
+    Normalize city name for weather API compatibility.
+    Remove extra spaces and standardize format.
+    
+    Args:
+        city: City name from LLM
+    
+    Returns:
+        Normalized city name
+    """
+    if not city:
+        return "제주"
+    
+    # Remove leading/trailing whitespace
+    city = city.strip()
+    
+    # Remove special characters or extra formatting
+    city = re.sub(r'[\(\)\[\]]', '', city).strip()
+    
+    # Remove province suffixes that might cause issues
+    city = re.sub(r'특별자치도|특별시|광역시|도$', '', city).strip()
+    
+    return city if city else "제주"
+
+
 def extract_json_text(raw_text):
+    """Legacy function - kept for compatibility"""
     text = (raw_text or "").strip()
     if not text:
         return "{}"
@@ -84,20 +149,26 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         prompt += "\n주의: 이전 응답의 JSON 파싱에 실패했습니다. 규칙에 맞춰 정확한 JSON만 반환하세요."
 
     try:
+        # Force JSON response format using GenerationConfig
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.7
+            )
         )
 
-        cleaned_text = extract_json_text(response.text)
-        data = json.loads(cleaned_text)
+        # Use robust JSON parser
+        data = safe_parse_json(response.text)
 
-        if not isinstance(data, dict):
-            raise ValueError("LLM 응답이 JSON 객체가 아닙니다.")
+        # Normalize city name
+        recommended_city = data.get("recommended_city", "제주")
+        if isinstance(recommended_city, str):
+            recommended_city = normalize_city_name(recommended_city)
 
         return {
-            "recommended_city": data.get("recommended_city", "제주"),
+            "recommended_city": recommended_city,
             "weather": data.get("weather", "날씨 정보 없음"),
             "events": data.get("events", []) if isinstance(data.get("events", []), list) else [],
             "reason": data.get("reason", "추천 근거를 확인할 수 없습니다.")
@@ -202,7 +273,7 @@ def generate_final_report(date_str, rec_data, places, errors_list):
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=prompt
         )
         return response.text
