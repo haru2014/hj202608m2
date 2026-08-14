@@ -9,6 +9,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
 ENV_PATH = os.path.join(PROJECT_DIR, ".env")
@@ -39,6 +46,38 @@ if not GEMINI_API_KEY or not KAKAO_REST_API_KEY:
     sys.exit(1)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+CANDIDATE_GEMINI_MODELS = [
+    os.getenv("GEMINI_MODEL", "gemini-3.7-flash"),
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+]
+
+
+def call_gemini(prompt: str, is_json: bool = False, temperature: float = 0.7) -> str:
+    """
+    Call Gemini API with automatic model fallback and JSON structure enforcement.
+    """
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json" if is_json else "text/plain",
+        temperature=temperature
+    )
+
+    last_error = None
+    for model_name in CANDIDATE_GEMINI_MODELS:
+        try:
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config
+            )
+            if response and response.text:
+                return response.text
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise last_error or RuntimeError("Gemini API 호출에 실패했습니다.")
 
 
 def parse_arguments():
@@ -67,19 +106,18 @@ def safe_parse_json(raw_text: str) -> dict:
     Raises:
         ValueError: If JSON parsing fails
     """
-    if not raw_text:
+    if not raw_text or not raw_text.strip():
         raise ValueError("LLM 응답이 비어있습니다.")
 
     # Remove markdown code fences
     cleaned = re.sub(r'```(?:json)?\s*([\s\S]*?)\s*```', r'\1', raw_text).strip()
-    
-    # If no markdown was found, try basic extraction
+
+    # If no markdown was found or brackets still need extraction
     if not cleaned or cleaned == raw_text.strip():
-        # Try to find JSON object pattern
         json_match = re.search(r'\{[\s\S]*\}', cleaned or raw_text)
         if json_match:
             cleaned = json_match.group(0)
-    
+
     try:
         result = json.loads(cleaned)
         if not isinstance(result, dict):
@@ -94,7 +132,7 @@ def safe_parse_json(raw_text: str) -> dict:
 
 def normalize_city_name(city: str) -> str:
     """
-    Normalize city name for weather API compatibility.
+    Normalize city name for weather API and map search compatibility.
     Remove extra spaces and standardize format.
     
     Args:
@@ -105,16 +143,16 @@ def normalize_city_name(city: str) -> str:
     """
     if not city:
         return "제주"
-    
+
     # Remove leading/trailing whitespace
     city = city.strip()
-    
+
     # Remove special characters or extra formatting
     city = re.sub(r'[\(\)\[\]]', '', city).strip()
-    
-    # Remove province suffixes that might cause issues
+
+    # Remove administrative suffixes for search consistency
     city = re.sub(r'특별자치도|특별시|광역시|도$', '', city).strip()
-    
+
     return city if city else "제주"
 
 
@@ -149,18 +187,11 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         prompt += "\n주의: 이전 응답의 JSON 파싱에 실패했습니다. 규칙에 맞춰 정확한 JSON만 반환하세요."
 
     try:
-        # Force JSON response format using GenerationConfig
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.7
-            )
-        )
+        # Generate JSON content with forced MIME type and model fallback
+        raw_text = call_gemini(prompt, is_json=True, temperature=0.7)
 
         # Use robust JSON parser
-        data = safe_parse_json(response.text)
+        data = safe_parse_json(raw_text)
 
         # Normalize city name
         recommended_city = data.get("recommended_city", "제주")
@@ -272,11 +303,8 @@ def generate_final_report(date_str, rec_data, places, errors_list):
     """
 
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=prompt
-        )
-        return response.text
+        report_text = call_gemini(prompt, is_json=False)
+        return report_text
     except Exception as exc:
         errors_list.append({
             "step": "report_generation",
@@ -325,3 +353,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
