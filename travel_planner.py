@@ -56,7 +56,6 @@ CANDIDATE_GEMINI_MODELS = [
     os.getenv("GEMINI_MODEL", "gemini-3.7-flash"),
     "gemini-3-flash-preview",
     "gemini-flash-latest",
-    "gemini-2.5-flash",
 ]
 
 
@@ -419,7 +418,66 @@ def generate_final_report(date_str, rec_data, places, errors_list):
             "type": "LLM_ERROR",
             "message": str(exc)
         })
-        return f"# {date_str} 여행 리포트 생성 실패\n\n리포트 생성 중 오류가 발생했습니다: {exc}"
+        
+        # Local fallback markdown generator
+        fallback_md = []
+        fallback_md.append(f"# ✈️ {date_str} 여행 계획 리포트 (예비 생성)")
+        fallback_md.append(f"\n> **안내**: LLM을 통한 리포트 생성에 실패하여 로컬 데이터를 기반으로 리포트를 긴급 생성했습니다. (오류: {exc})\n")
+        
+        city = rec_data.get('recommended_city', '제주')
+        reason = rec_data.get('reason', '기본 추천 도시로 대체되었습니다.')
+        weather = rec_data.get('weather', '날씨 정보 파싱 실패')
+        events = rec_data.get('events', [])
+        
+        fallback_md.append(f"## 📍 추천 여행지: {city}")
+        fallback_md.append(f"- **추천 이유**: {reason}")
+        fallback_md.append(f"- **날씨 요약**: {weather}")
+        if events:
+            fallback_md.append(f"- **주요 행사 및 축제**: {', '.join(events)}")
+        fallback_md.append("")
+        
+        fallback_md.append("## 🍴 추천 맛집 및 장소")
+        if places:
+            for idx, p in enumerate(places, 1):
+                name = p.get("name", "이름 없음")
+                address = p.get("address", "주소 정보 없음")
+                category = p.get("category", "")
+                url = p.get("url", "")
+                
+                place_line = f"{idx}. **{name}**"
+                if category:
+                    place_line += f" ({category.split(' > ')[-1]})"
+                fallback_md.append(place_line)
+                fallback_md.append(f"   - 주소: {address}")
+                if url:
+                    fallback_md.append(f"   - [Kakao Map 바로가기]({url})")
+        else:
+            fallback_md.append("> **데이터 없음 (장소 검색 결과 0건)**")
+            fallback_md.append("인근의 대표적인 전통시장이나 향토 음식점(예: 향토시장, 전통 5일장)을 대안으로 추천해 드립니다.")
+        fallback_md.append("")
+        
+        # 1-day itinerary suggestion
+        fallback_md.append("## 📅 제안 일정 (오전/오후/저녁)")
+        fallback_md.append(f"- **오전 (09:00 - 12:00)**: {city} 도착 및 대표 관광 명소 탐방")
+        if places:
+            fallback_md.append(f"- **오후 (12:00 - 18:00)**: 맛집 `{places[0].get('name')}`에서 맛있는 식사 및 주변 카페/거리 투어")
+        else:
+            fallback_md.append(f"- **오후 (12:00 - 18:00)**: 현지 음식점에서 점심 식사 후 주변 관광지 방문")
+        if len(places) > 1:
+            fallback_md.append(f"- **저녁 (18:00 - 21:00)**: `{places[1].get('name')}`에서 저녁 식사 및 대표 야경 감상")
+        else:
+            fallback_md.append(f"- **저녁 (18:00 - 21:00)**: 저녁 식사 후 숙소 이동 및 휴식")
+        fallback_md.append("")
+        
+        # Errors section
+        fallback_md.append("## ⚠️ 발생한 오류 요약 (Errors Summary)")
+        if errors_list:
+            for err in errors_list:
+                fallback_md.append(f"- **{err.get('step', 'N/A')}** ({err.get('type', 'N/A')}): {err.get('message', 'N/A')}")
+        else:
+            fallback_md.append("- 발생한 오류가 없습니다.")
+            
+        return "\n".join(fallback_md)
 
 
 def sanitize_sensitive_data(text: str) -> str:
@@ -458,6 +516,22 @@ def append_errors_history(date_str: str, errors: list):
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def is_failed_report(md_path: str) -> bool:
+    """
+    Check if the markdown report doesn't exist, is empty, or represents a failed generation attempt.
+    """
+    if not os.path.exists(md_path) or os.path.getsize(md_path) == 0:
+        return True
+    try:
+        with open(md_path, "r", encoding="utf-8") as f:
+            content = f.read(1024)  # Read the first 1KB
+            if "리포트 생성 실패" in content or "오류가 발생했습니다" in content or "예비 생성" in content:
+                return True
+    except Exception:
+        return True
+    return False
 
 
 def append_error_md(errors: list, date_str: str = None):
@@ -523,9 +597,9 @@ def main():
             errors_list = cached_raw.get("errors", [])
             print(f"  - 캐시 로드 완료 (추천 도시: \"{rec_data.get('recommended_city')}\", 맛집: {len(places)}곳)")
 
-            # Re-generate report if md is missing
-            if not os.path.exists(md_path):
-                print(f"[3/3] 최종 리포트 재생성 중(LLM)...")
+            # Re-generate report if md is missing or was a failed attempt
+            if is_failed_report(md_path):
+                print(f"[3/3] 최종 리포트 재생성/복원 중(LLM)...")
                 orig_err_count = len(errors_list)
                 report_md = generate_final_report(date_str, rec_data, places, errors_list)
                 with open(md_path, "w", encoding="utf-8") as file_obj:

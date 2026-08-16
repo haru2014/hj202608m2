@@ -19,3 +19,9 @@
   - **오류 유형 (Type)**: `AUTH_ERROR`
   - **오류 메시지 (Message)**: Kakao HTTP 401
 
+
+## [2026-08-16 14:51:34] 여행 날짜: 2026-08-20
+- **단계 (Step)**: `report_generation`
+  - **오류 유형 (Type)**: `LLM_ERROR`
+  - **오류 메시지 (Message)**: 401 UNAUTHENTICATED. {'error': {'code': 401, 'message': 'Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project.', 'status': 'UNAUTHENTICATED', 'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'ACCESS_TOKEN_TYPE_UNSUPPORTED', 'metadata': {'method': 'google.ai.generativelanguage.v1beta.GenerativeService.GenerateContent', 'service': 'generativelanguage.googleapis.com'}}]}}
+
