@@ -144,19 +144,27 @@ def safe_parse_json(raw_text: str) -> dict:
 def validate_recommendation_schema(data: dict, errors_list: list) -> dict:
     """
     Strict validation for LLM recommendation JSON schema.
-    Validates presence and types of required keys: recommended_city, weather, events, reason.
+    Validates presence and types of required keys inside the recommendations list.
     """
+    default_recommendation = {
+        "recommended_city": "제주",
+        "weather": "해당 시기 온화한 기후",
+        "events": ["지역 대표 문화 행사"],
+        "reason": "추천 스키마 검증 실패로 기본 추천이 제공됩니다."
+    }
+
     if not isinstance(data, dict):
         error_msg = "LLM 응답이 딕셔너리(JSON Object) 형태가 아닙니다."
         errors_list.append({"step": "schema_validation", "type": "TYPE_ERROR", "message": error_msg})
-        return {
-            "recommended_city": "제주",
-            "weather": "해당 시기 온화한 기후",
-            "events": ["지역 대표 문화 행사"],
-            "reason": "추천 스키마 검증 실패로 기본 추천이 제공됩니다."
-        }
+        return {"recommendations": [default_recommendation]}
 
-    validated = {}
+    recommendations = data.get("recommendations")
+    if not isinstance(recommendations, list) or not recommendations:
+        error_msg = "필수 키 'recommendations'가 누락되었거나 리스트 형식이 아닙니다."
+        errors_list.append({"step": "schema_validation", "type": "MISSING_OR_INVALID_LIST", "message": error_msg})
+        return {"recommendations": [default_recommendation]}
+
+    validated_list = []
     required_keys = {
         "recommended_city": (str, "제주"),
         "weather": (str, "해당 시기 온화한 기후"),
@@ -164,36 +172,49 @@ def validate_recommendation_schema(data: dict, errors_list: list) -> dict:
         "reason": (str, "해당 시기에 방문하기 적합한 추천 여행지입니다.")
     }
 
-    for key, (expected_type, default_val) in required_keys.items():
-        val = data.get(key)
-        if val is None:
+    for idx, item in enumerate(recommendations):
+        if not isinstance(item, dict):
             errors_list.append({
                 "step": "schema_validation",
-                "type": "MISSING_KEY",
-                "message": f"필수 키 '{key}'가 누락되어 기본값으로 대체되었습니다."
+                "type": "INVALID_ITEM_TYPE",
+                "message": f"recommendations의 {idx}번째 요소가 객체(dict) 형식이 아닙니다."
             })
-            validated[key] = default_val
-        elif not isinstance(val, expected_type):
-            errors_list.append({
-                "step": "schema_validation",
-                "type": "INVALID_TYPE",
-                "message": f"키 '{key}'의 타입({type(val).__name__})이 예상 타입({expected_type.__name__})과 일치하지 않습니다."
-            })
-            validated[key] = default_val
-        elif isinstance(val, str) and not val.strip():
-            errors_list.append({
-                "step": "schema_validation",
-                "type": "EMPTY_STRING",
-                "message": f"키 '{key}'가 빈 문자열이어서 기본값으로 대체되었습니다."
-            })
-            validated[key] = default_val
-        elif isinstance(val, list):
-            cleaned_list = [str(item).strip() for item in val if str(item).strip()]
-            validated[key] = cleaned_list if cleaned_list else default_val
-        else:
-            validated[key] = val.strip() if isinstance(val, str) else val
+            validated_list.append(default_recommendation.copy())
+            continue
 
-    return validated
+        validated_item = {}
+        for key, (expected_type, default_val) in required_keys.items():
+            val = item.get(key)
+            if val is None:
+                errors_list.append({
+                    "step": "schema_validation",
+                    "type": "MISSING_KEY",
+                    "message": f"추천 항목 {idx}에서 필수 키 '{key}'가 누락되어 기본값으로 대체되었습니다."
+                })
+                validated_item[key] = default_val
+            elif not isinstance(val, expected_type):
+                errors_list.append({
+                    "step": "schema_validation",
+                    "type": "INVALID_TYPE",
+                    "message": f"추천 항목 {idx}의 키 '{key}' 타입({type(val).__name__})이 예상 타입({expected_type.__name__})과 다릅니다."
+                })
+                validated_item[key] = default_val
+            elif isinstance(val, str) and not val.strip():
+                errors_list.append({
+                    "step": "schema_validation",
+                    "type": "EMPTY_STRING",
+                    "message": f"추천 항목 {idx}의 키 '{key}'가 빈 문자열이어서 기본값으로 대체되었습니다."
+                })
+                validated_item[key] = default_val
+            elif isinstance(val, list):
+                cleaned_list = [str(e).strip() for e in val if str(e).strip()]
+                validated_item[key] = cleaned_list if cleaned_list else default_val
+            else:
+                validated_item[key] = val.strip() if isinstance(val, str) else val
+
+        validated_list.append(validated_item)
+
+    return {"recommendations": validated_list}
 
 
 CITY_ALIASES = {
@@ -254,18 +275,22 @@ def normalize_city_name(city: str) -> str:
 
 def get_llm_recommendation(date_str, errors_list, is_retry=False):
     """
-    Step 1: Request structured travel recommendation from Gemini LLM.
+    Step 1: Request structured travel recommendations from Gemini LLM.
     """
     prompt = f"""
-    당신은 여행 전문가입니다. 여행 날짜 '{date_str}'에 가기 좋은 한국의 도시 1곳을 추천해주세요.
+    당신은 여행 전문가입니다. 여행 날짜 '{date_str}'에 가기 좋은 한국의 서로 다른 도시 2~3곳을 추천해주세요.
     응답은 반드시 아래 JSON 스키마를 엄격히 준수하여 오직 JSON 형식의 텍스트만 출력하세요. 다른 설명은 포함하지 마세요.
 
     JSON 스키마:
     {{
-      "recommended_city": "도시명 (예: 제주, 강릉)",
-      "weather": "해당 시기 일반적 날씨 요약",
-      "events": ["행사 또는 축제 후보 1~3개"],
-      "reason": "추천 근거 2~4문장"
+      "recommendations": [
+        {{
+          "recommended_city": "도시명 (예: 제주, 강릉)",
+          "weather": "해당 시기 일반적 날씨 요약",
+          "events": ["행사 또는 축제 후보 1~3개"],
+          "reason": "추천 근거 2~4문장"
+        }}
+      ]
     }}
     """
 
@@ -283,8 +308,9 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         validated_data = validate_recommendation_schema(raw_data, errors_list)
 
         # Advanced City name normalization
-        recommended_city = normalize_city_name(validated_data["recommended_city"])
-        validated_data["recommended_city"] = recommended_city
+        for item in validated_data["recommendations"]:
+            recommended_city = normalize_city_name(item["recommended_city"])
+            item["recommended_city"] = recommended_city
 
         return validated_data
 
@@ -300,10 +326,14 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
         }
         errors_list.append(error_record)
         return {
-            "recommended_city": "제주",
-            "weather": "날씨 정보 파싱 실패",
-            "events": [],
-            "reason": "기본 추천 도시로 대체되었습니다."
+            "recommendations": [
+                {
+                    "recommended_city": "제주",
+                    "weather": "날씨 정보 파싱 실패",
+                    "events": [],
+                    "reason": "기본 추천 도시로 대체되었습니다."
+                }
+            ]
         }
 
 
@@ -383,30 +413,27 @@ def get_place_search_provider() -> PlaceSearchProvider:
     return KakaoPlaceSearchProvider(api_key=KAKAO_REST_API_KEY)
 
 
-def generate_final_report(date_str, rec_data, places, errors_list):
+def generate_final_report(date_str, recommendations, errors_list):
     """
-    Step 3: Generate rich Markdown travel report using LLM.
+    Step 3: Generate rich Markdown travel report using LLM for multiple recommended cities.
     """
-    places_str = json.dumps(places, ensure_ascii=False, indent=2) if places else "데이터 없음 (장소 검색 결과 0건)"
+    rec_str = json.dumps(recommendations, ensure_ascii=False, indent=2)
     errors_str = json.dumps(errors_list, ensure_ascii=False, indent=2) if errors_list else "없음"
 
     prompt = f"""
-    당신은 여행 리포트 작성가입니다. 아래 제공된 정보로 여행 리포트를 Markdown 형식으로 작성해주세요.
+    당신은 여행 리포트 작성가입니다. 아래 제공된 정보를 바탕으로 여러 추천 여행지들을 비교 및 제안하는 종합 여행 리포트를 Markdown 형식으로 작성해주세요.
 
     [기본 정보]
     - 여행 날짜: {date_str}
-    - 추천 지역: {rec_data.get('recommended_city')}
-    - 추천 이유: {rec_data.get('reason')}
-    - 날씨 요약: {rec_data.get('weather')}
-    - 행사/축제: {', '.join(rec_data.get('events', []))}
-    - 맛집 정보: {places_str}
+    - 추천 지역 및 맛집 목록: {rec_str}
     - 발생한 오류: {errors_str}
 
     [작성 규칙]
     - 마크다운 헤더(#, ##)를 활용하여 정돈된 문서로 만드세요.
-    - 맛집 정보가 '데이터 없음'이거나 빈 배열이면 맛집 섹션에 "데이터 없음 (장소 검색 결과 0건)"으로 강조 표기하고, 인근 대표 향토음식이나 전통시장을 대안으로 추천하세요.
-    - 오전/오후/저녁으로 나눈 1일 일정 제안 코너를 포함하세요.
-    - 오류 내역(errors) 섹션을 마지막에 포함하세요.
+    - 전체 개요(예: "추천 여행지 개요 및 비교")를 처음에 작성하고, 그 다음 각 추천 도시별로 세부 섹션을 나누어 상세히 작성하세요.
+    - 각 도시별 맛집 정보가 비어 있거나 '데이터 없음'이면 맛집 섹션에 "데이터 없음 (장소 검색 결과 0건)"으로 강조 표기하고, 인근 대표 향토음식이나 전통시장을 대안으로 추천하세요.
+    - 추천 도시 각각에 대해 오전/오후/저녁으로 나눈 1일 일정 제안 코너를 반드시 포함하세요.
+    - 발생한 오류 내역(errors) 섹션을 리포트의 맨 마지막에 포함하세요.
     """
 
     try:
@@ -424,51 +451,53 @@ def generate_final_report(date_str, rec_data, places, errors_list):
         fallback_md.append(f"# ✈️ {date_str} 여행 계획 리포트 (예비 생성)")
         fallback_md.append(f"\n> **안내**: LLM을 통한 리포트 생성에 실패하여 로컬 데이터를 기반으로 리포트를 긴급 생성했습니다. (오류: {exc})\n")
         
-        city = rec_data.get('recommended_city', '제주')
-        reason = rec_data.get('reason', '기본 추천 도시로 대체되었습니다.')
-        weather = rec_data.get('weather', '날씨 정보 파싱 실패')
-        events = rec_data.get('events', [])
-        
-        fallback_md.append(f"## 📍 추천 여행지: {city}")
-        fallback_md.append(f"- **추천 이유**: {reason}")
-        fallback_md.append(f"- **날씨 요약**: {weather}")
-        if events:
-            fallback_md.append(f"- **주요 행사 및 축제**: {', '.join(events)}")
-        fallback_md.append("")
-        
-        fallback_md.append("## 🍴 추천 맛집 및 장소")
-        if places:
-            for idx, p in enumerate(places, 1):
-                name = p.get("name", "이름 없음")
-                address = p.get("address", "주소 정보 없음")
-                category = p.get("category", "")
-                url = p.get("url", "")
-                
-                place_line = f"{idx}. **{name}**"
-                if category:
-                    place_line += f" ({category.split(' > ')[-1]})"
-                fallback_md.append(place_line)
-                fallback_md.append(f"   - 주소: {address}")
-                if url:
-                    fallback_md.append(f"   - [Kakao Map 바로가기]({url})")
-        else:
-            fallback_md.append("> **데이터 없음 (장소 검색 결과 0건)**")
-            fallback_md.append("인근의 대표적인 전통시장이나 향토 음식점(예: 향토시장, 전통 5일장)을 대안으로 추천해 드립니다.")
-        fallback_md.append("")
-        
-        # 1-day itinerary suggestion
-        fallback_md.append("## 📅 제안 일정 (오전/오후/저녁)")
-        fallback_md.append(f"- **오전 (09:00 - 12:00)**: {city} 도착 및 대표 관광 명소 탐방")
-        if places:
-            fallback_md.append(f"- **오후 (12:00 - 18:00)**: 맛집 `{places[0].get('name')}`에서 맛있는 식사 및 주변 카페/거리 투어")
-        else:
-            fallback_md.append(f"- **오후 (12:00 - 18:00)**: 현지 음식점에서 점심 식사 후 주변 관광지 방문")
-        if len(places) > 1:
-            fallback_md.append(f"- **저녁 (18:00 - 21:00)**: `{places[1].get('name')}`에서 저녁 식사 및 대표 야경 감상")
-        else:
-            fallback_md.append(f"- **저녁 (18:00 - 21:00)**: 저녁 식사 후 숙소 이동 및 휴식")
-        fallback_md.append("")
-        
+        for idx, rec in enumerate(recommendations, 1):
+            city = rec.get('recommended_city', '제주')
+            reason = rec.get('reason', '기본 추천 도시로 대체되었습니다.')
+            weather = rec.get('weather', '날씨 정보 파싱 실패')
+            events = rec.get('events', [])
+            places = rec.get('places', [])
+            
+            fallback_md.append(f"## 📍 추천 여행지 {idx}: {city}")
+            fallback_md.append(f"- **추천 이유**: {reason}")
+            fallback_md.append(f"- **날씨 요약**: {weather}")
+            if events:
+                fallback_md.append(f"- **주요 행사 및 축제**: {', '.join(events)}")
+            fallback_md.append("")
+            
+            fallback_md.append("### 🍴 추천 맛집 및 장소")
+            if places:
+                for p_idx, p in enumerate(places, 1):
+                    name = p.get("name", "이름 없음")
+                    address = p.get("address", "주소 정보 없음")
+                    category = p.get("category", "")
+                    url = p.get("url", "")
+                    
+                    place_line = f"{p_idx}. **{name}**"
+                    if category:
+                        place_line += f" ({category.split(' > ')[-1]})"
+                    fallback_md.append(place_line)
+                    fallback_md.append(f"   - 주소: {address}")
+                    if url:
+                        fallback_md.append(f"   - [Kakao Map 바로가기]({url})")
+            else:
+                fallback_md.append("> **데이터 없음 (장소 검색 결과 0건)**")
+                fallback_md.append("인근의 대표적인 전통시장이나 향토 음식점(예: 향토시장, 전통 5일장)을 대안으로 추천해 드립니다.")
+            fallback_md.append("")
+            
+            # 1-day itinerary suggestion
+            fallback_md.append("### 📅 제안 일정 (오전/오후/저녁)")
+            fallback_md.append(f"- **오전 (09:00 - 12:00)**: {city} 도착 및 대표 관광 명소 탐방")
+            if places:
+                fallback_md.append(f"- **오후 (12:00 - 18:00)**: 맛집 `{places[0].get('name')}`에서 맛있는 식사 및 주변 카페/거리 투어")
+            else:
+                fallback_md.append(f"- **오후 (12:00 - 18:00)**: 현지 음식점에서 점심 식사 후 주변 관광지 방문")
+            if len(places) > 1:
+                fallback_md.append(f"- **저녁 (18:00 - 21:00)**: `{places[1].get('name')}`에서 저녁 식사 및 대표 야경 감상")
+            else:
+                fallback_md.append(f"- **저녁 (18:00 - 21:00)**: 저녁 식사 후 숙소 이동 및 휴식")
+            fallback_md.append("\n---\n")
+            
         # Errors section
         fallback_md.append("## ⚠️ 발생한 오류 요약 (Errors Summary)")
         if errors_list:
@@ -591,17 +620,40 @@ def main():
         print(f"[CACHE] 기존 캐시 데이터({json_path})를 발견하여 API 호출을 건너뛰고 재사용합니다.")
         try:
             with open(json_path, "r", encoding="utf-8") as f:
-                cached_raw = json.load(f)
-            rec_data = cached_raw.get("recommendation", {})
-            places = cached_raw.get("places", [])
+                cached_data = json.load(f)
+            
+            if isinstance(cached_data, list):
+                cached_raw = cached_data[-1] if cached_data else {}
+            else:
+                cached_raw = cached_data
+
             errors_list = cached_raw.get("errors", [])
-            print(f"  - 캐시 로드 완료 (추천 도시: \"{rec_data.get('recommended_city')}\", 맛집: {len(places)}곳)")
+            
+            # 복수 추천 스키마 호환성 변환
+            if "recommendations" in cached_raw:
+                recommendations = cached_raw["recommendations"]
+            else:
+                # 구버전 캐시 포맷
+                rec_data = cached_raw.get("recommendation", {})
+                places = cached_raw.get("places", [])
+                recommendations = [
+                    {
+                        "recommended_city": rec_data.get("recommended_city", "제주"),
+                        "weather": rec_data.get("weather", "날씨 정보 없음"),
+                        "events": rec_data.get("events", []),
+                        "reason": rec_data.get("reason", ""),
+                        "places": places
+                    }
+                ]
+
+            cities_str = ", ".join([r.get("recommended_city", "") for r in recommendations])
+            print(f"  - 캐시 로드 완료 (추천 도시: \"{cities_str}\")")
 
             # Re-generate report if md is missing or was a failed attempt
             if is_failed_report(md_path):
                 print(f"[3/3] 최종 리포트 재생성/복원 중(LLM)...")
                 orig_err_count = len(errors_list)
-                report_md = generate_final_report(date_str, rec_data, places, errors_list)
+                report_md = generate_final_report(date_str, recommendations, errors_list)
                 with open(md_path, "w", encoding="utf-8") as file_obj:
                     file_obj.write(sanitize_sensitive_data(report_md))
                 if len(errors_list) > orig_err_count:
@@ -615,33 +667,57 @@ def main():
 
     print(f"[1/3] 1차 추천 생성 중(LLM)...")
     rec_data = get_llm_recommendation(date_str, errors_list)
-    city = rec_data.get("recommended_city", "제주")
-    print(f"  - recommended_city: \"{city}\"")
+    recommendations = rec_data.get("recommendations", [])
+    cities_str = ", ".join([r.get("recommended_city", "") for r in recommendations])
+    print(f"  - recommended_cities: \"{cities_str}\"")
 
     print(f"[2/3] 맛집 검색 중(지도/장소 API)...")
     place_provider = get_place_search_provider()
-    places = place_provider.search_places(city, errors_list)
+    for rec in recommendations:
+        city = rec.get("recommended_city", "제주")
+        print(f"  - '{city}' 맛집 검색 중...")
+        places = place_provider.search_places(city, errors_list)
+        rec["places"] = places
 
     print(f"[3/3] 최종 리포트 생성 중(LLM)...")
-    report_md = generate_final_report(date_str, rec_data, places, errors_list)
+    report_md = generate_final_report(date_str, recommendations, errors_list)
     print("  - 리포트 생성 완료")
 
     raw_data = {
         "date": date_str,
-        "recommendation": rec_data,
-        "places": places,
+        "recommendations": recommendations,
         "errors": errors_list
     }
 
+    # Load existing JSON data to append
+    existing_list = []
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as file_obj:
+                existing_data = json.load(file_obj)
+            if isinstance(existing_data, list):
+                existing_list = existing_data
+            elif isinstance(existing_data, dict):
+                existing_list = [existing_data]
+        except Exception as exc:
+            print(f"  [경고] 기존 JSON 파일 로드 실패({exc}). 새로운 파일로 재작성합니다.")
+            existing_list = []
+
+    existing_list.append(raw_data)
+
     # Sanitize and write files
-    sanitized_json = sanitize_sensitive_data(json.dumps(raw_data, ensure_ascii=False, indent=2))
+    sanitized_json = sanitize_sensitive_data(json.dumps(existing_list, ensure_ascii=False, indent=2))
     sanitized_md = sanitize_sensitive_data(report_md)
 
     with open(json_path, "w", encoding="utf-8") as file_obj:
         file_obj.write(sanitized_json)
 
-    with open(md_path, "w", encoding="utf-8") as file_obj:
-        file_obj.write(sanitized_md)
+    if os.path.exists(md_path) and os.path.getsize(md_path) > 0:
+        with open(md_path, "a", encoding="utf-8") as file_obj:
+            file_obj.write("\n\n---\n\n" + sanitized_md)
+    else:
+        with open(md_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(sanitized_md)
 
     # Append errors to persistent log if any
     append_errors_history(date_str, errors_list)
