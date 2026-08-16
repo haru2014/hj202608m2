@@ -53,8 +53,8 @@ if not GEMINI_API_KEY or not KAKAO_REST_API_KEY:
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 CANDIDATE_GEMINI_MODELS = [
-    os.getenv("GEMINI_MODEL", "gemini-3.7-flash"),
-    "gemini-3-flash-preview",
+    os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+    "gemini-3.5-flash",
     "gemini-flash-latest",
 ]
 
