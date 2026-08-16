@@ -1,6 +1,6 @@
 # ✈️ 국내 여행지 및 맛집 추천 프로그램 (Travel Planner CLI)
 
-사용자가 입력한 여행 날짜(`--date "YYYY-MM-DD"`)를 기반으로 **Google Gemini API**와 **Kakao Local API**를 연동하여 국내 최적의 여행지를 추천하고, 현지 맛집 정보와 1일 일정 계획이 담긴 최종 여행 리포트를 자동 생성하는 Python CLI 애플리케이션입니다.
+사용자가 입력한 여행 날짜(`--date "YYYY-MM-DD"`)를 기반으로 **Google Gemini API**와 **Kakao Local API**를 연동하여 국내 최적의 여행지들(2~3곳)을 복수 추천하고, 각 지역별 현지 맛집 정보와 1일 일정 계획이 담긴 종합 여행 리포트를 자동 생성하며 검색 이력을 누적 기록하는 Python CLI 애플리케이션입니다.
 
 본 문서는 **사전평가 결과 2차(17개 평가 지표)**의 피드백을 전면 수용하여, **스키마 엄격 검증, 지도 API 추상화 계층, 재실행 캐싱, 고급 도시명 정규화, HTTP 메서드 설계 근거, 시크릿 관리 가이드** 등을 완벽하게 보강한 최종 가이드입니다.
 
@@ -18,7 +18,7 @@
 [캐시 검사 (선택)] ──(기존 캐시 발견 시)──> [results/{date}_raw.json 즉시 로드 (비용 절감)]
        │ (캐시 미사용/미존재 시)
        ▼
-[1단계: Gemini LLM 1차 추천] ──> response_mime_type="application/json" (POST)
+[1단계: Gemini LLM 2~3곳 추천] ──> response_mime_type="application/json" (POST)
        │
        ▼
 [Robust JSON 파서 & 스키마 엄격 검증] ──> safe_parse_json & validate_recommendation_schema
@@ -26,17 +26,17 @@
        ▼
 [고급 도시명 정규화] ──> CITY_ALIASES 매핑, 세부 지역 추출, 행정구역 접미사 제거
        │
-       ▼ (정규화된 도시명 키워드 전달)
-[2단계: 추상화 지도 API 계층] ──> PlaceSearchProvider (KakaoLocalProvider, GET 멱등 검색)
+       ▼ (정규화된 각 도시명 키워드 전달)
+[2단계: 추상화 지도 API 계층 (루프)] ──> PlaceSearchProvider (도시별 맛집 검색 및 매핑)
        │   - 1차: '{city} 맛집' ➔ 실패 시 fallback: '{city} 식당' / '{city} 카페'
-       ▼ (추천 데이터 + 맛집 데이터 종합)
-[3단계: Gemini LLM 최종 리포트 생성] ──> Markdown 포맷 생성 (1일 코스, 맛집, 축제, 오류 요약)
+       ▼ (복수 추천 데이터 + 도시별 맛집 데이터 종합)
+[3단계: Gemini LLM 종합 리포트 생성] ──> Markdown 포맷 생성 (도시별 개요 표, 1일 코스, 맛집, 오류)
        │
        ▼
 [보안 검증 및 결과물 저장] ──> API 키 마스킹 (sanitize_sensitive_data)
        │
        ▼
-[results/ 디렉터리 산출물] ──> YYYY-MM-DD_raw.json & YYYY-MM-DD_travel_plan.md
+[results/ 디렉터리 산출물] ──> YYYY-MM-DD_raw.json & YYYY-MM-DD_travel_plan.md (누적 Append)
 ```
 
 ### 📂 모듈 및 함수별 책임 매핑 (Module & Function Responsibilities)
@@ -200,7 +200,7 @@ results/
 └── errors_history.json          # 발생한 에러 내역 누적 보존 로그
 ```
 
-* **저장 정책 (Overwrite Policy)**: 동일 날짜로 재실행 시 최신 추천 정보로 자동 덮어쓰기(Overwrite)되며, 캐시 보존을 원할 경우 `--use-cache` 플래그를 사용합니다.
+* **저장 정책 (Accumulative Append Policy)**: 동일 날짜로 새로 실행할 때마다 기존 결과를 덮어쓰지 않고, 이전 추천 데이터 및 마크다운 리포트 이력 뒤에 신규 이력이 순차적으로 누적(Append)됩니다. 캐시 데이터의 재사용을 원할 경우 `--use-cache` 플래그를 사용하며, 이 경우 누적 데이터 중 가장 최근 검색 이력을 기준으로 캐시가 복원됩니다.
 * **오류 장기 보존 정책**: 실행 중 발생한 API 오류는 `results/errors_history.json`에 타임스탬프와 함께 영구 누적 기록되어 품질 개선 모니터링에 활용됩니다.
 
 ---
