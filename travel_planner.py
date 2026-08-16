@@ -20,8 +20,10 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_DIR, "results")
+ERROR_DIR = os.path.join(PROJECT_DIR, "error")
 ENV_PATH = os.path.join(PROJECT_DIR, ".env")
 ERRORS_HISTORY_PATH = os.path.join(RESULTS_DIR, "errors_history.json")
+ERROR_MD_PATH = os.path.join(ERROR_DIR, "error.md")
 
 
 def load_runtime_env():
@@ -44,8 +46,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY")
 
 if not GEMINI_API_KEY or not KAKAO_REST_API_KEY:
-    print("[ERROR] API 키가 설정되지 않았습니다.")
-    print(".env 파일에 GEMINI_API_KEY와 KAKAO_REST_API_KEY가 바르게 입력되었는지 확인하세요.")
+    err_msg = "API 키가 설정되지 않았습니다. .env 파일에 GEMINI_API_KEY와 KAKAO_REST_API_KEY가 바르게 입력되었는지 확인하세요."
+    print(f"[ERROR] {err_msg}")
+    append_error_md([{"step": "initialization", "type": "ENV_ERROR", "message": err_msg}])
     sys.exit(1)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -93,15 +96,19 @@ def parse_arguments():
     args = parser.parse_args()
 
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
-        print("[ERROR] 올바르지 않은 날짜 형식입니다. 'YYYY-MM-DD' 형식으로 입력해주세요.")
+        err_msg = f"올바르지 않은 날짜 형식입니다: '{args.date}'. 'YYYY-MM-DD' 형식으로 입력해주세요."
+        print(f"[ERROR] {err_msg}")
         parser.print_help()
+        append_error_md([{"step": "argument_parsing", "type": "VALIDATION_ERROR", "message": err_msg}])
         sys.exit(1)
 
     try:
         datetime.strptime(args.date, "%Y-%m-%d")
     except ValueError:
-        print(f"[ERROR] 달력에 존재하지 않는 유효하지 않은 날짜입니다: '{args.date}'")
+        err_msg = f"달력에 존재하지 않는 유효하지 않은 날짜입니다: '{args.date}'"
+        print(f"[ERROR] {err_msg}")
         parser.print_help()
+        append_error_md([{"step": "argument_parsing", "type": "VALIDATION_ERROR", "message": err_msg}])
         sys.exit(1)
 
     return args.date, args.use_cache
@@ -453,6 +460,50 @@ def append_errors_history(date_str: str, errors: list):
         pass
 
 
+def append_error_md(errors: list, date_str: str = None):
+    """
+    Append error logs in Markdown format to error/error.md.
+    """
+    if not errors:
+        return
+    try:
+        os.makedirs(ERROR_DIR, exist_ok=True)
+        write_header = not os.path.exists(ERROR_MD_PATH) or os.path.getsize(ERROR_MD_PATH) == 0
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        md_lines = []
+        if write_header:
+            md_lines.append("# 오류 기록 (Error History Log)")
+            md_lines.append("\n이 파일은 프로그램 실행 중 발생한 오류들을 누적 기록하는 파일입니다.\n")
+        
+        if date_str:
+            md_lines.append(f"## [{timestamp}] 여행 날짜: {date_str}")
+        else:
+            md_lines.append(f"## [{timestamp}] 시스템/초기화 오류")
+            
+        for err in errors:
+            step = err.get("step", "N/A")
+            err_type = err.get("type", "N/A")
+            message = err.get("message", "N/A")
+            # Sanitize sensitive data in error messages
+            message = sanitize_sensitive_data(message)
+            md_lines.append(f"- **단계 (Step)**: `{step}`")
+            md_lines.append(f"  - **오류 유형 (Type)**: `{err_type}`")
+            md_lines.append(f"  - **오류 메시지 (Message)**: {message}")
+        
+        md_lines.append("") # Empty line separator
+        
+        output_content = "\n".join(md_lines) + "\n"
+        if not write_header:
+            output_content = "\n" + output_content
+            
+        with open(ERROR_MD_PATH, "a", encoding="utf-8") as f:
+            f.write(output_content)
+    except Exception as exc:
+        print(f"[WARNING] error.md 기록 실패: {exc}", file=sys.stderr)
+
+
 def main():
     date_str, use_cache = parse_arguments()
     errors_list = []
@@ -475,9 +526,13 @@ def main():
             # Re-generate report if md is missing
             if not os.path.exists(md_path):
                 print(f"[3/3] 최종 리포트 재생성 중(LLM)...")
+                orig_err_count = len(errors_list)
                 report_md = generate_final_report(date_str, rec_data, places, errors_list)
                 with open(md_path, "w", encoding="utf-8") as file_obj:
                     file_obj.write(sanitize_sensitive_data(report_md))
+                if len(errors_list) > orig_err_count:
+                    new_errors = errors_list[orig_err_count:]
+                    append_error_md(new_errors, date_str)
 
             print(f"\n완료 (캐시 활용)! {md_path} 및 {json_path} 를 확인하세요.")
             return
@@ -516,9 +571,16 @@ def main():
 
     # Append errors to persistent log if any
     append_errors_history(date_str, errors_list)
+    append_error_md(errors_list, date_str)
 
     print(f"\n완료! {md_path} 및 {json_path} 를 확인하세요.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        err_msg = f"프로그램 실행 중 예기치 못한 에러가 발생했습니다: {e}"
+        print(f"[FATAL] {err_msg}", file=sys.stderr)
+        append_error_md([{"step": "main_execution", "type": "UNHANDLED_EXCEPTION", "message": err_msg}])
+        sys.exit(1)
