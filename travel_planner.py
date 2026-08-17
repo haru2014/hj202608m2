@@ -5,6 +5,7 @@ import re  # 정규표현식을 사용한 패턴 매칭을 위한 모듈
 import sys  # 시스템 관련 파라미터와 함수에 접근하기 위한 모듈
 from abc import ABC, abstractmethod  # 추상 클래스를 정의하기 위한 모듈
 from datetime import datetime  # 날짜와 시간을 다루기 위한 모듈
+import random  # 다양한 도시를 무작위로 샘플링하기 위한 모듈
 
 import requests  # HTTP 요청을 보내 외부 API(카카오 지도 등)와 통신하기 위한 라이브러리
 from dotenv import load_dotenv  # .env 파일에서 환경변수를 로드하기 위한 라이브러리
@@ -324,16 +325,31 @@ def get_llm_recommendation(date_str, errors_list, is_retry=False):
     """
     (1단계) 구글 Gemini LLM에 요청하여 주어진 날짜에 가기 좋은 국내 여행 도시 추천 정보를 생성합니다.
     """
+    # 추천 가능한 다양한 국내 관광 도시 후보군
+    CANDIDATE_CITIES = [
+        "제주", "강릉", "부산", "경주", "전주", "여수", "속초", "가평", "양평", 
+        "태안", "춘천", "포항", "단양", "남해", "안동", "순천", "거제", "평창", 
+        "인제", "통영", "수원", "강화", "삼척", "영월", "보성", "담양", "목포"
+    ]
+    # 무작위로 8개의 도시를 샘플링하여 프롬프트에 힌트로 전달함으로써 특정 도시 쏠림 현상을 방지합니다.
+    suggested = random.sample(CANDIDATE_CITIES, 8)
+    suggested_str = ", ".join(suggested)
+
     # LLM이 출력 형태를 정확하게 유지하도록 상세하게 프롬프트를 작성합니다.
     prompt = f"""
     당신은 여행 전문가입니다. 여행 날짜 '{date_str}'에 가기 좋은 한국의 서로 다른 도시 2~3곳을 추천해주세요.
+    매번 특정 유명 도시(제주, 부산, 강릉 등)만 편중되어 추천되지 않도록, 아래 제공된 후보군 목록을 포함하여 전국 각지의 숨겨진 명소와 다양한 여행 도시를 무작위로 고려해서 고르게 추천해야 합니다.
+    
+    [추천 고려 대상 도시 예시]
+    {suggested_str} (이 목록 외에 다른 국내의 매력적인 도시를 자유롭게 추천해도 무방합니다)
+
     응답은 반드시 아래 JSON 스키마를 엄격히 준수하여 오직 JSON 형식의 텍스트만 출력하세요. 다른 설명은 포함하지 마세요.
 
     JSON 스키마:
     {{
       "recommendations": [
         {{
-          "recommended_city": "도시명 (예: 제주, 강릉)",
+          "recommended_city": "도시명 (예: 경주, 여수)",
           "weather": "해당 시기 일반적 날씨 요약",
           "events": ["행사 또는 축제 후보 1~3개"],
           "reason": "추천 근거 2~4문장"
